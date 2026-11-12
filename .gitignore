@@ -1,14 +1,29 @@
-# Игнорируем тяжелые нейросети
+# Weights & local models
+models/*.gguf
+*.bin
 *.gguf
-models/
+Modelfile
+Modelfile.*
 
-# Игнорируем конфиденциальные логи памяти и дневника
-*.json
-*.txt
-data/
-
-# Игнорируем кэш Python и окружение
-__pycache__/
-.venv/
+# Personal memory, snapshots, logs & environment secrets
 .env
 .snapshots/
+.cache/
+chat_memory.json
+fable_diary.txt
+*.log
+*.old
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
