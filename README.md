@@ -50,14 +50,21 @@ eliza-agent-core/
 
 ## Quick Start
 
-### 1. Automated Environment Setup
-Clone the repository and run the setup script. It automatically detects NVIDIA GPUs (`nvidia-smi`), configures CUDA-accelerated `llama-cpp-python` (with automatic Windows CUDA DLL path registration), or falls back cleanly to CPU mode:
-
+### 1. Automated Setup
+Clone the repository and run the setup script, which configures GPU acceleration or falls back to CPU automatically:
 ```bash
-/allinvvs/eliza-agent-core.git
+git clone https://github.com
 cd eliza-agent-core
 python install.py
 ```
+
+### 2. Model Configuration
+Place your quantized `.gguf` model (Gemma, Qwen, Llama) into `models/model.gguf` and set `MODEL_GPU_LAYERS` in `.env`.
+
+### 3. Launch Modes
+* **Interactive CLI:** `python main.py`
+* **HTTP API Server:** `python server.py`
+* **Unit Tests:** `python -m unittest discover tests`
 
 ### 2. Model Configuration
 Place any quantized `.gguf` model (e.g., Gemma, Qwen, or Llama) into `models/model.gguf` and adjust `MODEL_GPU_LAYERS` in `.env` according to your available VRAM.
