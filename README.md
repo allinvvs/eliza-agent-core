@@ -1,6 +1,6 @@
 ﻿# ELIZA v5 — Modular Local AI Agent & JSON HTTP Core
 
-![ELIZA Core CI](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml/badge.svg)
+[![ELIZA Core CI](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml/badge.svg)](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)
 ![Hardware](https://img.shields.io/badge/VRAM-4GB%20CUDA%20Optimized-green)
 
