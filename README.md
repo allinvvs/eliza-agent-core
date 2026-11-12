@@ -53,18 +53,10 @@ eliza-agent-core/
 ### 1. Automated Setup
 Clone the repository and run the setup script, which configures GPU acceleration or falls back to CPU automatically:
 ```bash
-git clone https://github.com
+git clone https://github.com/allinvvs/eliza-agent-core.git
 cd eliza-agent-core
 python install.py
 ```
-
-### 2. Model Configuration
-Place your quantized `.gguf` model (Gemma, Qwen, Llama) into `models/model.gguf` and set `MODEL_GPU_LAYERS` in `.env`.
-
-### 3. Launch Modes
-* **Interactive CLI:** `python main.py`
-* **HTTP API Server:** `python server.py`
-* **Unit Tests:** `python -m unittest discover tests`
 
 ### 2. Model Configuration
 Place any quantized `.gguf` model (e.g., Gemma, Qwen, or Llama) into `models/model.gguf` and adjust `MODEL_GPU_LAYERS` in `.env` according to your available VRAM.
