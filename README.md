@@ -54,7 +54,7 @@ eliza-agent-core/
 Clone the repository and run the setup script. It automatically detects NVIDIA GPUs (`nvidia-smi`), configures CUDA-accelerated `llama-cpp-python` (with automatic Windows CUDA DLL path registration), or falls back cleanly to CPU mode:
 
 ```bash
-git clone https://github.com
+/allinvvs/eliza-agent-core.git
 cd eliza-agent-core
 python install.py
 ```
