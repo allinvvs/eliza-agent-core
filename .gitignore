@@ -1,18 +1,36 @@
+#Блок 1. Модели, память, секреты и временные файлы
 # Weights & local models
 models/*.gguf
-*.bin
 *.gguf
+*.bin
+*.safetensors
+*.onnx
 Modelfile
 Modelfile.*
 
-# Personal memory, snapshots, logs & environment secrets
+# Personal memory, snapshots, logs & secrets
 .env
+.env.*
+!.env.example
 .snapshots/
 .cache/
 chat_memory.json
 fable_diary.txt
 *.log
 *.old
+*.tmp
+*.bak
+*.sqlite*
+*.db
+
+#Блок 2. Сборка пакетов, окружения, кэши тестов и ОС
+
+# Packaging & build artifacts (PEP 517 / setuptools)
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
 
 # Python cache & virtual environments
 __pycache__/
@@ -22,8 +40,16 @@ __pycache__/
 venv/
 env/
 
+# Testing, coverage & linters cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
 # IDE & OS files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+desktop.ini

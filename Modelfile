@@ -1,3 +1,0 @@
-﻿FROM D:\fable5\models\model.gguf
-PARAMETER num_ctx 20480
-PARAMETER num_thread 6

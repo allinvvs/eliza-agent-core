@@ -340,8 +340,7 @@ class ElizaAPIHandler(BaseHTTPRequestHandler):
             logger.error(f"HTTP /chat error: {e}")
             self._send_json(500, {"status": "error", "message": str(e)})
 
-
-if __name__ == "__main__":
+def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), ElizaAPIHandler)
     logger.info(f"ELIZA JSON HTTP API listening on http://{HOST}:{PORT}")
     try:
@@ -351,3 +350,8 @@ if __name__ == "__main__":
         memory.save_history()
         breathing_mod.stop()
         server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+
