@@ -78,53 +78,90 @@ eliza-agent-core/
 
 ---
 
-## Quick Start
+## Quick Start (Beginner-Friendly)
 
-### 1. PEP 621 Package Installation
-Clone the repository and install it in editable mode with either CUDA or CPU extras:
+All commands below can be run in **Windows PowerShell**, **VS Code Terminal** (`Ctrl + ~`), or **Linux/macOS Bash**.
+
+### 1. Clone & Create a Virtual Environment
 ```bash
 git clone https://github.com/allinvvs/eliza-agent-core.git
 cd eliza-agent-core
 
-# For NVIDIA GPUs (includes pynvml C-API telemetry & llama-cpp-python):
+# Create and activate an isolated Python environment
+python -m venv .venv
+
+# Windows (PowerShell):
+.venv\Scripts\Activate.ps1
+# Linux / macOS:
+source .venv/bin/activate
+```
+
+### 2. PEP 621 Package Installation
+Install the project in editable mode with either CUDA or CPU extras:
+```bash
+# For NVIDIA GPUs (includes pynvml C-API telemetry & CUDA-ready llama-cpp-python):
 pip install -e ".[cuda]"
 
-# Or for CPU-only environments:
+# Or for CPU-only machines (no NVIDIA GPU):
 pip install -e ".[cpu]"
 ```
 
-### 2. Model Configuration
-Copy `.env.example` to `.env`, place any quantized `.gguf` model (e.g., Gemma, Qwen, or Llama) into `models/model.gguf`, and adjust `MODEL_GPU_LAYERS` according to your available VRAM.
+### 3. Download a Quantized Model (`.gguf`)
+> **Note:** Model weights are not included in this repository due to GitHub file size limits.
 
-### 3. Launch Modes
-* **Interactive CLI Mode:**
+1. Download any quantized `.gguf` model from [Hugging Face](https://huggingface.co) (recommended quantization: **`Q4_K_M`** for 4–6 GB VRAM, e.g. *Gemma*, *Qwen 2.5/3*, or *Llama 3*).
+2. Create a `models/` folder in the project root and place the file at **`models/model.gguf`**.
+3. Copy `.env.example` to `.env` and set `MODEL_GPU_LAYERS` according to your hardware:
+   * **CPU only:** `MODEL_GPU_LAYERS=0`
+   * **4 GB VRAM (e.g. GTX 1650):** `MODEL_GPU_LAYERS=20` – `24`
+   * **6–8+ GB VRAM (e.g. RTX 3060 / 4060):** `MODEL_GPU_LAYERS=-1` (offloads 100% of layers to GPU)
+
+### 4. Launch Modes
+* **Interactive CLI Chat (supports `/pc`, `/web`, `/plugins`, `/metrics`):**
   ```bash
   eliza
   ```
-* **JSON & SSE Streaming HTTP Server:**
+* **JSON, SSE & OpenAI-Compatible HTTP Server (`http://127.0.0.1:8000`):**
   ```bash
   eliza-server
   ```
-* **Run Unit Tests (No GPU/Model Required):**
+* **Run Offline Unit Tests (no GPU or `.gguf` model needed):**
   ```bash
   python -m unittest discover -s tests -v
   ```
 
 ---
 
+## Connecting External UIs & IDE Extensions
+
+Because `eliza-server` implements the OpenAI `/v1/chat/completions` and `/v1/models` specification, you can connect compatible frontends (such as **Open WebUI**, **SillyTavern**, or **Continue** in VS Code) out of the box:
+
+* **Base URL:** `http://127.0.0`
+* **Model ID:** `eliza-v5-local`
+* **API Key:** `not-needed` (any non-empty string)
+
+---
+
 ## HTTP API Reference (`server.py`)
 
-* `POST /chat` — Execute an inference turn with cascaded GBNF plugin routing and memory retrieval:
+* `POST /chat` — Execute a synchronous inference turn with slash-command routing (`/pc`, `/web`), single-pass plugin execution, memory retrieval, and per-turn telemetry (`metrics`):
   ```json
-  { "message": "Check GPU chip temperature and free VRAM" }
+  { "message": "/pc Check GPU chip temperature and free VRAM" }
   ```
-* `POST /chat` (**SSE Token Streaming**) — Set `"stream": true` to receive real-time `text/event-stream` chunks while filtering internal `<thought>` blocks on the fly:
+* `POST /chat` (**Native SSE Token Streaming**) — Set `"stream": true` to receive real-time `text/event-stream` chunks (`token`, `status: "thinking"`, `status: "tool"`, `done`) while filtering internal `<thought>` blocks on the fly:
   ```json
   { "message": "Explain CPU pipeline stages briefly", "stream": true }
   ```
-* `GET /status` — Returns active plugins, memory statistics, and current adaptive sampler parameters.
-* `GET /notifications` — Retrieves autonomous background observations generated during idle periods.
-* `POST /v1/chat/completions` (**OpenAI-Compatible API**) — Drop-in endpoint for Open WebUI, Continue, and standard OpenAI SDK clients (supports both sync JSON and `"stream": true` SSE chunks).
+* `POST /v1/chat/completions` (**OpenAI-Compatible API**) — Drop-in endpoint for OpenAI SDKs and third-party frontends (supports both synchronous `chat.completion` JSON with `eliza_metrics` and `"stream": true` `chat.completion.chunk` SSE streams):
+  ```json
+  {
+    "model": "eliza-v5-local",
+    "messages": [{ "role": "user", "content": "Hello, Eliza!" }],
+    "stream": false
+  }
+  ```
 * `GET /v1/models` — Lists the local `eliza-v5-local` model for OpenAI-compatible client auto-discovery.
+* `GET /status` — Returns active plugins, memory statistics, context window size, and current adaptive sampler parameters.
+* `GET /notifications` — Retrieves autonomous background observations generated during idle periods.
 
 
