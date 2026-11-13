@@ -74,7 +74,8 @@ class TestElizaCore(unittest.TestCase):
             self.assertIsNone(tool)
 
     def test_agent_engine_slash_command_and_sandbox(self):
-        self.assertIn("заблокирован", execute_os_command("mkdir C:/Windows/test_dir").lower())
+        forbidden_dir = "C:/Windows/test_dir" if os.name == "nt" else "/etc/eliza_test_dir"
+        self.assertIn("заблокирован", execute_os_command(f"mkdir {forbidden_dir}").lower())
         self.assertIn("отклонена", execute_os_command("powershell -Command whoami").lower())
 
         with tempfile.TemporaryDirectory() as tmpdir:
