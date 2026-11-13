@@ -31,7 +31,7 @@
 
 ---
 
-## Hardware Benchmarks (NVIDIA GTX 1650 4GB)
+## Hardware Benchmarks (NVIDIA GTX 1650 4GB + 16GB RAM)
 
 | Subsystem / Metric | Implementation | Measured Latency / Footprint |
 | :--- | :--- | :--- |
