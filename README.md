@@ -164,4 +164,15 @@ Because `eliza-server` implements the OpenAI `/v1/chat/completions` and `/v1/mod
 * `GET /status` — Returns active plugins, memory statistics, context window size, and current adaptive sampler parameters.
 * `GET /notifications` — Retrieves autonomous background observations generated during idle periods.
 
+---
+
+## Author & Project Philosophy
+
+Developed and maintained by **ElizaDev** (`@allinvvs`) out of pure passion for local AI and low-VRAM systems engineering.
+
+* **Open-Source Commitment:** Patches, performance optimizations, and new plugins will continue to roll out steadily whenever possible—this project is driven by engineering curiosity, not paywalls.
+* **Optional Support:** If `eliza-agent-core` saved you time, helped squeeze extra performance out of your GPU, or inspired your own local agent, you can optionally support future hardware tests and development via **USDT (TRC20)**:
+  ```text
+  TVkMpQQVDmBMhB4UGsvY6RAVKWjYBbeGc8
+  ```
 
