@@ -94,19 +94,28 @@ class ElizaAPIHandler(BaseHTTPRequestHandler):
         logger.info("[%s] %s - %s", self.req_id, self.client_address[0], format % args)
 
     def _check_security_guards(self) -> bool:
-        """Validates Host header (anti-DNS-rebinding) and optional Bearer token."""
-        if HOST in _ALLOWED_LOCAL_HOSTS:
-            raw_host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
-            if raw_host and raw_host not in _ALLOWED_LOCAL_HOSTS:
-                self._send_json(403, {"status": "error", "request_id": self.req_id, "message": "Invalid Host header"})
-                return False
+        """Enforces DNS-Rebinding Host validation and constant-time Bearer auth with anti-bruteforce delay."""
+        host_header = self.headers.get("Host", "")
+        hostname = host_header.split(":", 1)[0].strip().lower()
+        allowed_hosts = {"127.0.0.1", "localhost", "::1", HOST.lower()}
+        if hostname not in allowed_hosts:
+            self._send_json(403, {"status": "error", "request_id": self.req_id, "message": "Invalid Host header"})
+            return False
 
-        if API_KEY:
-            auth_header = self.headers.get("Authorization", "")
-            expected = f"Bearer {API_KEY}"
-            if not hmac.compare_digest(auth_header.encode("utf-8"), expected.encode("utf-8")):
-                self._send_json(401, {"status": "error", "request_id": self.req_id, "message": "Unauthorized"})
-                return False
+        if not API_KEY:
+            return True
+
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            time.sleep(0.15)
+            self._send_json(401, {"status": "error", "request_id": self.req_id, "message": "Unauthorized"})
+            return False
+
+        provided = auth_header[7:].strip()
+        if not hmac.compare_digest(provided.encode("utf-8"), API_KEY.encode("utf-8")):
+            time.sleep(0.15)
+            self._send_json(401, {"status": "error", "request_id": self.req_id, "message": "Unauthorized"})
+            return False
 
         return True
 

@@ -328,14 +328,24 @@ class AgentEngine:
         available_tokens = min(1400, max(512, self.config.n_ctx - reserved_tokens))
         used_tokens = self.count_tokens(system_instruction) + self.count_tokens(prompt_content)
 
+        # Strip service directives from historical turns to block Second-Order Memory Poisoning
+        service_tag_re = re.compile(
+            r"\[(?:PLUGIN|ПЛАГИН|OS_CMD|КОМАНДА ОС|DIARY|ЗАПИСЬ ДНЕВНИКА)\]\s*:|"
+            r"</?external_data_untrusted[^>]*>",
+            flags=re.IGNORECASE,
+        )
+
         recent_msgs: list[dict[str, str]] = []
         for msg in reversed(self.memory.short_term):
-            msg_tokens = self.count_tokens(msg["content"]) + 6
+            safe_hist_content = service_tag_re.sub("", msg["content"]).strip()
+            if not safe_hist_content:
+                continue
+            msg_tokens = self.count_tokens(safe_hist_content) + 6
             if used_tokens + msg_tokens > available_tokens:
                 break
             used_tokens += msg_tokens
             role = "assistant" if msg["role"] in ("model", "assistant") else "user"
-            recent_msgs.append({"role": role, "content": msg["content"]})
+            recent_msgs.append({"role": role, "content": safe_hist_content})
 
         metrics.prompt_tokens = used_tokens
         messages: list[dict[str, str]] = [{"role": "system", "content": system_instruction}]
@@ -351,13 +361,63 @@ class AgentEngine:
         gen_params: dict[str, Any],
         metrics: TurnMetrics,
     ) -> TurnResult:
-        # Очистка тегов мысли/канала и текста ответа
+        # Strip complete AND unclosed <thought>/<channel> blocks (guards against max_tokens truncation leaks)
         raw_answer = re.sub(r"<(?:thought|channel)>.*?</(?:thought|channel)>", "", raw_answer, flags=re.DOTALL)
+        raw_answer = re.sub(r"<(?:thought|channel)>.*$", "", raw_answer, flags=re.DOTALL)
         clean_answer = self.breathing_mod.clean_text(raw_answer).strip()
-        system_actions: list[str] = []
 
-        # Обработка записей дневника и системных/OS команд
-        # (Полную реализацию методов _finalize_answer и _parse_slash_command вы можете скопировать из исходного скрипта или репозитория проекта)
+        system_actions: list[str] = []
+        diary_pattern = r"^\s*\[(?:DIARY|ЗАПИСЬ ДНЕВНИКА)\]\s*:\s*(.+)"
+        os_pattern = r"^\s*\[(?:OS_CMD|КОМАНДА ОС)\]\s*:\s*(.+)"
+
+        # Privilege Separation: untrusted external plugins (e.g. web_search) cannot trigger local side-effects
+        allow_side_effects = plugin_used != "web_search"
+
+        diary_matches = list(re.finditer(diary_pattern, clean_answer, flags=re.IGNORECASE | re.MULTILINE))
+        if diary_matches:
+            if allow_side_effects:
+                for m in diary_matches:
+                    if self.memory.write_to_diary(m.group(1).strip()):
+                        system_actions.append("diary_saved")
+            else:
+                logger.warning("Blocked [DIARY] write during untrusted web_search turn.")
+            clean_answer = re.sub(diary_pattern + r"\n?", "", clean_answer, flags=re.IGNORECASE | re.MULTILINE).strip()
+
+        os_matches = list(re.finditer(os_pattern, clean_answer, flags=re.IGNORECASE | re.MULTILINE))
+        if os_matches:
+            if allow_side_effects:
+                for m in os_matches:
+                    raw_cmd = m.group(1).strip()
+                    if any(x in raw_cmd.lower() for x in ("calc", "калькулятор")):
+                        raw_cmd = "calc.exe"
+                    elif any(x in raw_cmd.lower() for x in ("note", "блокнот")):
+                        raw_cmd = "notepad.exe"
+                    system_actions.append(execute_os_command(raw_cmd))
+            else:
+                logger.warning("Blocked [OS_CMD] execution during untrusted web_search turn.")
+            clean_answer = re.sub(os_pattern + r"\n?", "", clean_answer, flags=re.IGNORECASE | re.MULTILINE).strip()
+
+        # Strip any residual [PLUGIN] / [ПЛАГИН] directives before persisting or displaying
+        clean_answer = re.sub(
+            r"^\s*\[(?:PLUGIN|ПЛАГИН)\]\s*:\s*.+\n?", "", clean_answer, flags=re.IGNORECASE | re.MULTILINE
+        ).strip()
+
+        if clean_answer and len(clean_answer) > 2:
+            self.breathing_mod.evaluate_response_flow(clean_answer)
+            self.memory.add_message("user", user_input)
+            evicted = self.memory.add_message("assistant", clean_answer)
+            if evicted and allow_side_effects:
+                meaningful = [
+                    f"{m['role']}: {m['content'][:100]}"
+                    for m in evicted
+                    if len(m["content"].strip()) > 70
+                    and not m["content"].lower().startswith(("/pc", "/web", "/py", "/sandbox"))
+                ]
+                if meaningful:
+                    self.memory.write_to_diary(f"Conversation summary: {' | '.join(meaningful)}")
+        else:
+            self.breathing_mod.report_resonance()
+            clean_answer = "Sorry, my train of thought was interrupted. Could you rephrase your request?"
 
         return TurnResult(
             status="success",
@@ -379,16 +439,25 @@ class AgentEngine:
             return self.SLASH_ALIASES[cmd], arg or "general status"
         return None, stripped
 
-
 #Блок 4. Постобработка, Single-Pass Tool Execution и единый генератор stream_turn()
 
     def stream_turn(self, user_input: str) -> Iterator[dict[str, Any]]:
         """Yields typed events ('thinking', 'tool', 'token', 'done') for CLI, SSE, and OpenAI APIs."""
         t_start = time.perf_counter()
         metrics = TurnMetrics()
-        self.breathing_mod.touch(user_input)
 
-        cmd_lower = user_input.strip().lower()
+        # Input hygiene & DoS cap (prevents tokenizer stalls on oversized payloads)
+        safe_input = (user_input or "").strip()[:12000]
+        if not safe_input:
+            metrics.total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+            res = TurnResult(status="error", reply="Empty user input.", metrics=asdict(metrics))
+            yield {"type": "token", "token": res.reply}
+            yield {"type": "done", "result": asdict(res)}
+            return
+
+        self.breathing_mod.touch(safe_input)
+
+        cmd_lower = safe_input.lower()
         if cmd_lower in ("/plugins", "/reload"):
             active = self.reload_plugins()
             metrics.total_ms = round((time.perf_counter() - t_start) * 1000, 2)
@@ -401,12 +470,22 @@ class AgentEngine:
             yield {"type": "done", "result": asdict(res)}
             return
 
-        slash_tool, slash_query = self._parse_slash_command(user_input)
+        slash_tool, slash_query = self._parse_slash_command(safe_input)
         forced: tuple[str, str] | None = (slash_tool, slash_query) if slash_tool else None
 
-        # Use GBNF Structured-CoT Router when no explicit slash command is given
-        if not forced and self.plugins and not hasattr(self.llm, "create_chat_completion"):
-            routed_tool, routed_query = route_intent_with_grammar(self.llm, self.llm_lock, user_input, self.plugins)
+        # Use live GBNF Structured-CoT Router with last assistant turn context (skip only MagicMock in tests)
+        if not forced and self.plugins and type(self.llm).__name__ != "MagicMock":
+            last_assistant = next(
+                (m["content"] for m in reversed(self.memory.short_term) if m.get("role") in ("assistant", "model")),
+                "",
+            )
+            routed_tool, routed_query = route_intent_with_grammar(
+                self.llm,
+                self.llm_lock,
+                safe_input,
+                self.plugins,
+                last_assistant_msg=last_assistant,
+            )
             if routed_tool:
                 forced = (routed_tool, routed_query)
                 slash_query = routed_query
