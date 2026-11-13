@@ -53,3 +53,8 @@ htmlcov/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+sandbox_workspace/
+*.log
+*.log.old
+*.tmp

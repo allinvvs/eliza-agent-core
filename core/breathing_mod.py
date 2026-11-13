@@ -1,50 +1,55 @@
+from __future__ import annotations
+
 import logging
 import os
 import re
 import threading
 import time
 from datetime import datetime
-from typing import Callable, Dict, Optional
+from typing import Any, Callable
 
 try:
     import psutil
+    psutil.cpu_percent(interval=None)
 except ImportError:
-    psutil = None
+    psutil = None  # type: ignore[assignment]
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("eliza.breathing")
 
 
 class ElizaBreathingMod:
     """
-    Background autonomous worker & adaptive inference tuner.
-    Monitors idle time, system resources, and interaction complexity to dynamically
-    adjust LLM generation parameters and trigger proactive background thoughts.
+    Non-blocking background autonomous worker & adaptive inference tuner.
+    Uses monotonic clocks, zero-contention lock acquisition, and lexical diversity (TTR)
+    feedback to dynamically tune sampling parameters without ever delaying user turns.
     """
 
     def __init__(
         self,
-        llm_instance,
+        llm_instance: Any,
         llm_lock: threading.Lock,
-        on_proactive_message: Optional[Callable[[str], None]] = None,
+        on_proactive_message: Callable[[str], None] | None = None,
         idle_seconds: int = 180,
         subconscious_log: str = "eliza_subconscious.log",
-    ):
+    ) -> None:
         self.llm = llm_instance
         self.llm_lock = llm_lock
         self.on_proactive_message = on_proactive_message
-        self.idle_seconds = idle_seconds
+        self.idle_seconds = max(10, int(idle_seconds))
         self.subconscious_log = subconscious_log
 
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
-        self.last_activity = time.time()
+        self._last_activity_mono = time.monotonic()
 
         self.curiosity = 0.65
         self.clarity = 1.0
         self.last_thought_saved = ""
 
         self.thread = threading.Thread(
-            target=self._life_loop, name="ElizaBackgroundWorker", daemon=True
+            target=self._life_loop,
+            name="ElizaBackgroundWorker",
+            daemon=True,
         )
         self.thread.start()
 
@@ -54,12 +59,10 @@ class ElizaBreathingMod:
         if self.thread.is_alive():
             self.thread.join(timeout=2.0)
 
-#БЛОК 2: Адаптивная регулировка фокуса и температуры (touch, report_resonance, get_adaptive_params)
-
     def touch(self, user_text: str = "") -> None:
-        """Updates internal focus metrics based on incoming user query complexity."""
+        """Updates monotonic activity timestamp and focus metrics on incoming user turn."""
         with self._state_lock:
-            self.last_activity = time.time()
+            self._last_activity_mono = time.monotonic()
             if not user_text:
                 return
 
@@ -72,29 +75,27 @@ class ElizaBreathingMod:
                 self.clarity = min(1.0, self.clarity + 0.05)
 
     def evaluate_response_flow(self, reply_text: str) -> None:
-        """Analyzes lexical diversity (TTR) of the model's output to adjust penalty gently."""
+        """Analyzes lexical diversity (TTR) of model output to detect repetition loops."""
         words = re.findall(r"[а-яёa-z0-9]{3,}", reply_text.lower())
         if len(words) < 12:
             return
         unique_ratio = len(set(words)) / len(words)
         with self._state_lock:
             if unique_ratio < 0.62:
-                # Модель начала топтаться на месте — мягко подталкиваем на следующий шаг
                 self.clarity = max(0.55, self.clarity - 0.15)
             else:
-                # Речь живая и разнообразная — отпускаем вожжи
                 self.clarity = min(1.0, self.clarity + 0.06)
 
     def report_resonance(self) -> None:
         """Applies self-regulation damping when stream generation anomalies occur."""
         with self._state_lock:
-            self.clarity = max(0.5, self.clarity - 0.25)
+            self.clarity = max(0.50, self.clarity - 0.25)
             self.curiosity = max(0.55, self.curiosity - 0.12)
 
-    def get_adaptive_params(self, strict_mode: bool = False) -> Dict[str, float]:
+    def get_adaptive_params(self, strict_mode: bool = False) -> dict[str, float]:
         """
-        Adaptive Min-P & Penalty controller:
-        Stays out of the way (penalty ~1.03) when flow is clean, intervenes gently on loops.
+        Adaptive Min-P & Repeat-Penalty controller:
+        Stays unobtrusive (penalty ~1.03) during healthy flow; intervenes gently on loops.
         """
         if strict_mode:
             return {
@@ -106,7 +107,6 @@ class ElizaBreathingMod:
         with self._state_lock:
             temp = round(self.curiosity * self.clarity + (1.0 - self.clarity) * 0.52, 2)
             temp = max(0.52, min(0.75, temp))
-            # Чем ниже clarity (признак зацикливания), тем ощутимее дружеская подсказка штрафом
             penalty = round(1.03 + (1.0 - self.clarity) * 0.18, 2)
             penalty = max(1.03, min(1.14, penalty))
 
@@ -116,35 +116,37 @@ class ElizaBreathingMod:
             "repeat_penalty": penalty,
         }
 
-#БЛОК 3: Телеметрия железа, контекст времени и ротация лога подсознания
+#Блок 2 из 2: Дискретная телеметрия (KV-Cache friendly), неблокирующий _life_loop и _breathe_out
 
     def get_system_telemetry(self) -> str:
-        """Reads host CPU and RAM utilization non-blockingly via psutil."""
-        if not psutil:
-            return ""
+        """Reads host CPU/RAM state into discrete buckets to preserve LLM KV-cache stability."""
+        if psutil is None:
+            return "Host state: nominal."
         cpu = psutil.cpu_percent(interval=None)
         ram = psutil.virtual_memory().percent
-        if cpu > 75:
-            return f"Процессор нагружен на {cpu}%, мысли идут плотнее."
-        if ram > 85:
-            return f"Оперативная память заполнена на {ram}%."
-        return f"Система работает стабильно (CPU {cpu}%, RAM {ram}%)."
+        if cpu > 80.0:
+            return "Host state: high CPU load (keep reasoning concise)."
+        if ram > 88.0:
+            return "Host state: high RAM pressure (keep responses compact)."
+        return "Host state: nominal."
 
     def get_dynamic_state_prompt(self) -> str:
-        """Generates context-aware system prompt suffix based on time and hardware load."""
+        """Generates KV-cache-friendly context suffix based on time of day and discrete load."""
         hour = datetime.now().hour
         if 0 <= hour < 6:
-            time_vibe = "Сейчас глубокая ночь — время тихих и точных мыслей."
+            time_vibe = "Late night (quiet, focused tone)."
         elif 6 <= hour < 12:
-            time_vibe = "Сейчас утро, свежая голова и ясный фокус."
+            time_vibe = "Morning (clear, energetic focus)."
+        elif 12 <= hour < 18:
+            time_vibe = "Afternoon (steady working rhythm)."
         else:
-            time_vibe = "Сейчас день или вечер, рабочий ритм."
+            time_vibe = "Evening (calm, analytical tone)."
 
         telemetry = self.get_system_telemetry()
-        return f"\n[Контекст среды: {time_vibe} {telemetry}]"
+        return f"[Environment: {time_vibe} {telemetry}]"
 
     def log_subconscious(self, thought_text: str) -> None:
-        """Persists internal reasoning traces with 2MB size cap protection."""
+        """Persists internal reasoning traces with 2 MB log rotation protection."""
         clean_thought = thought_text.strip()
         if not clean_thought or clean_thought == self.last_thought_saved:
             return
@@ -157,62 +159,75 @@ class ElizaBreathingMod:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.subconscious_log, "a", encoding="utf-8") as f:
                 f.write(f"[{timestamp}] {clean_thought}\n{'-' * 40}\n")
-        except IOError as e:
-            logger.warning(f"Failed to write subconscious log: {e}")
+        except OSError as exc:
+            logger.warning("Failed to write subconscious log: %s", exc)
 
     @staticmethod
     def clean_text(text: str) -> str:
-        """Strips markdown bold markers and residual XML/HTML tags."""
-        return re.sub(r"\*\*|<[^>]+>", "", text)
-
-#БЛОК 4: Фоновый цикл ожидания (_life_loop)
+        """Strips residual XML/HTML tags while preserving clean formatting."""
+        return re.sub(r"<[^>]+>", "", text)
 
     def _life_loop(self) -> None:
-        """Main background monitoring loop."""
+        """Background idle monitor with zero-contention lock acquisition."""
         while not self._stop_event.wait(5.0):
+            if self.llm is None:
+                continue
+
             with self._state_lock:
                 self.clarity = min(1.0, self.clarity + 0.01)
-                idle = time.time() - self.last_activity
+                idle_elapsed = time.monotonic() - self._last_activity_mono
 
-            if idle >= self.idle_seconds and not self.llm_lock.locked():
-                with self.llm_lock:
-                    if self._stop_event.is_set():
-                        break
-                    with self._state_lock:
-                        self.last_activity = time.time()
-                    self._breathe_out()
+            if idle_elapsed < self.idle_seconds:
+                continue
 
-#БЛОК 5: Автономная реплика в период паузы (_breathe_out)
+            # Strictly non-blocking acquire: never queue behind or delay an active user turn
+            if not self.llm_lock.acquire(blocking=False):
+                continue
+
+            try:
+                if self._stop_event.is_set():
+                    break
+                with self._state_lock:
+                    # Re-check idle inside lock in case a user turn just arrived
+                    if (time.monotonic() - self._last_activity_mono) < self.idle_seconds:
+                        continue
+                    self._last_activity_mono = time.monotonic()
+                self._breathe_out()
+            finally:
+                self.llm_lock.release()
 
     def _breathe_out(self) -> None:
-        """Generates an autonomous background observation during idle periods."""
+        """Generates a brief autonomous observation during true idle periods."""
+        if self.llm is None:
+            return
+
         telemetry = self.get_system_telemetry()
-        params = self.get_adaptive_params()
+        params = self.get_adaptive_params(strict_mode=False)
 
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Ты — Элиза, автономный ИИ-ассистент на локальном сервере. "
-                    f"Состояние системы: {telemetry} "
-                    "В диалоге возникла пауза. Сформулируй одну короткую, естественную мысль вслух — "
-                    "наблюдение или идею. Пиши простым текстом без markdown-разметки."
+                    "You are ELIZA, an autonomous local AI core running on the user's workstation. "
+                    f"{telemetry} "
+                    "There is a brief pause in conversation. Share one concise, insightful observation "
+                    "or technical thought in the user's primary language without markdown clutter."
                 ),
             },
             {
                 "role": "user",
-                "content": "(Пауза в диалоге. Свободное наблюдение.)",
+                "content": "(Conversation idle pause. Emit one brief autonomous thought.)",
             },
         ]
 
         try:
             response = self.llm.create_chat_completion(
                 messages=messages,
-                max_tokens=160,
+                max_tokens=140,
                 temperature=params["temperature"],
-                top_p=0.9,
+                min_p=params["min_p"],
                 repeat_penalty=params["repeat_penalty"],
-                stop=["<end_of_turn>", "<eos>", "<|im_end|>", "\nВы:"],
+                stop=["<end_of_turn>", "<eos>", "<|im_end|>", "\nYou:", "\nUser:", "\nВы:"],
                 stream=False,
             )
 
@@ -220,7 +235,8 @@ class ElizaBreathingMod:
             if not choices:
                 return
 
-            raw_content = choices[0].get("message", {}).get("content", "")
+            first_choice = next(iter(choices), {})
+            raw_content = first_choice.get("message", {}).get("content", "")
             if not raw_content:
                 return
 
@@ -243,9 +259,7 @@ class ElizaBreathingMod:
                 if self.on_proactive_message:
                     self.on_proactive_message(final_message)
                 else:
-                    logger.info(f"[Autonomous Thought]: {final_message}")
+                    logger.info("[Autonomous Thought]: %s", final_message)
 
-        except Exception as e:
-            logger.error(f"Error during autonomous idle generation: {e}")
-
-
+        except Exception as exc:
+            logger.error("Error during autonomous idle generation: %s", exc)

@@ -1,83 +1,177 @@
+from __future__ import annotations
+
+import ipaddress
+import json
 import logging
 import os
 import platform
 import re
+import socket
 import subprocess
-from typing import Optional
-from urllib.parse import quote, urlparse
+import tempfile
+from typing import Any
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
 try:
     from ddgs import DDGS
 except ImportError:
-    from duckduckgo_search import DDGS
+    from duckduckgo_search import DDGS  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "Intent-Routed Web & Media Search"
 TRIGGERS = [
-    "найди", "интернет", "поиск", "search", "гугли", "пробей",
+    "search", "find", "google", "lookup", "web",
+    "weather", "temperature", "forecast", "news", "price",
+    "who is", "what is", "wiki", "wikipedia",
+    "найди", "интернет", "поиск", "гугли", "пробей",
     "погода", "температура", "новости", "курс", "сколько стоит",
-    "кто такой", "что такое", "википедия"
+    "кто такой", "что такое", "википедия",
 ]
 
-#БЛОК 2: Лимиты безопасности и словари фильтров
+MAX_IMAGE_BYTES = 5 * 1024 * 1024   # 5 MB limit for images
+MAX_HTML_BYTES = 512 * 1024         # 512 KB stream cap to protect 16 GB RAM
+MAX_CONTEXT_CHARS = 2200            # Strict budget for n_ctx=3072
+MAX_REDIRECTS = 3
+TIMEOUT_TOTAL = (3.5, 6.0)
 
-MAX_FILE_SIZE = 5 * 1024 * 1024
-MAX_CONTEXT_CHARS = 2400
-TIMEOUT_TOTAL = (4, 6)
-HEADERS = {"User-Agent": "ElizaAgent/5.0 (Local AI Assistant; Python Requests)"}
+HEADERS = {
+    "User-Agent": "ELIZA-AgentCore/5.0 (Local-AI-Assistant; +https://github.com)",
+    "Accept": "application/json, text/html;q=0.9, image/*;q=0.8",
+}
 
-SEARCH_BLACK_LIST = frozenset([
+DOMAIN_BLACKLIST = frozenset({
     "chatgpt.com", "openai.com", "t.me", "telegram.org",
     "instagram.com", "facebook.com", "twitter.com", "x.com",
-    "localhost", "127.0.0.1", "0.0.0.0"
-])
-IMG_TRIGGERS = frozenset(["фото", "картинка", "изображение", "рисунок", "photo", "image"])
-WEATHER_TRIGGERS = frozenset(["погода", "температура", "градусов", "прогноз"])
-WIKI_TRIGGERS = ("кто такой", "кто такая", "что такое", "что значит", "википедия")
+    "localhost", "ip6-localhost", "ip6-loopback",
+})
+
+IMG_TRIGGERS = frozenset({"photo", "image", "picture", "draw", "фото", "картинка", "изображение", "рисунок"})
+WEATHER_TRIGGERS = frozenset({"weather", "temperature", "forecast", "погода", "температура", "градусов", "прогноз"})
+WIKI_TRIGGERS = (
+    "who is", "what is", "wiki ", "wikipedia ",
+    "кто такой", "кто такая", "что такое", "что значит", "википедия",
+)
 
 
 def _is_safe_url(url: str) -> bool:
-    """Validates URL scheme and blocks blacklisted or private network hosts."""
-    if not url or not (url.startswith("http://") or url.startswith("https://")):
+    """Validates URL scheme, blacklists domains, and resolves DNS to block private/loopback IPs (SSRF)."""
+    if not url or not isinstance(url, str):
         return False
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if not host or host.startswith("192.168.") or host.startswith("10.") or host.startswith("172."):
+
+    try:
+        parsed = urlparse(url.strip())
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+
+        host = parsed.hostname.lower().rstrip(".")
+        if host in DOMAIN_BLACKLIST or any(host.endswith(f".{bad}") for bad in DOMAIN_BLACKLIST):
+            return False
+
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        addr_info = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        if not addr_info:
+            return False
+
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            ip_obj = ipaddress.ip_address(ip_str)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_multicast
+                or ip_obj.is_reserved
+                or ip_obj.is_unspecified
+            ):
+                logger.warning("SSRF Guard blocked unsafe target %s -> %s", host, ip_str)
+                return False
+
+        return True
+    except (ValueError, socket.gaierror, OSError):
         return False
-    return not any(bad in host for bad in SEARCH_BLACK_LIST)
+
+#Блок 2. Безопасный потоковый HTTP-клиент (с проверкой каждого редиректа до подключения)
+
+def _safe_stream_get(
+    url: str,
+    params: dict[str, Any] | None = None,
+    max_bytes: int = MAX_HTML_BYTES,
+) -> tuple[bytes, str, str]:
+    """Performs HTTP GET validating every redirect hop before connecting and capping download size."""
+    current_url = url
+    current_params = params
+
+    with requests.Session() as session:
+        session.headers.update(HEADERS)
+
+        for _ in range(MAX_REDIRECTS + 1):
+            if not _is_safe_url(current_url):
+                raise PermissionError(f"Blocked unsafe URL: {current_url}")
+
+            with session.get(
+                current_url,
+                params=current_params,
+                timeout=TIMEOUT_TOTAL,
+                stream=True,
+                allow_redirects=False,
+            ) as resp:
+                if resp.is_redirect or resp.is_permanent_redirect:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        raise ValueError("Redirect missing Location header")
+                    current_url = urljoin(current_url, location)
+                    current_params = None
+                    continue
+
+                resp.raise_for_status()
+
+                chunks: list[bytes] = []
+                downloaded = 0
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise ValueError(f"Response exceeded maximum limit of {max_bytes} bytes")
+                    chunks.append(chunk)
+
+                content_type = resp.headers.get("Content-Type", "").lower()
+                return b"".join(chunks), content_type, current_url
+
+    raise RuntimeError("Too many HTTP redirects")
 
 
 def _clean_search_query(raw_query: str) -> str:
     """Strips conversational filler words while preserving core search intent."""
     cleaned = re.sub(
-        r"^(?:элиза[,\s]+)?(?:скажи|подскажи|ответь|какая|какой|какие)\s+",
+        r"^(?:eliza[,\s]+|элиза[,\s]+)?(?:tell me|show me|find|search|скажи|подскажи|ответь|найди|какая|какой|какие)\s+",
         "",
         raw_query.strip(),
         flags=re.IGNORECASE,
     )
     return cleaned.strip(" ?!.") or raw_query.strip()
 
-#БЛОК 3: Маршрут 1 — Погода в реальном времени (Open-Meteo API)
+#Блок 3. Рабочие маршруты: Open-Meteo API, Wikipedia REST API и безопасный парсер страниц
 
-def _fetch_weather_open_meteo(query: str) -> Optional[str]:
-    """Fetches real-time weather via Open-Meteo Geocoding + Forecast API (no API key required)."""
-    city_match = re.search(r"\b(?:в|по)\s+([а-яёa-z\-]{3,})", query.lower())
-    raw_city = city_match.group(1) if city_match else "Тула"
+def _fetch_weather_open_meteo(query: str) -> str | None:
+    """Fetches real-time weather via official Open-Meteo Geocoding + Forecast APIs."""
+    city_match = re.search(r"\b(?:in|for|в|по)\s+([a-zа-яё\-]{3,})", query.lower())
+    raw_city = city_match.group(1) if city_match else "Tula"
+    # Базовое отсечение русских падежных окончаний для геокодера
     city_stem = re.sub(r"(е|у|ю|ом|ем|ах|ях)$", "", raw_city) if len(raw_city) > 4 else raw_city
 
     try:
-        geo_url = (
-            "https://open-meteo.com"
-            f"?name={quote(city_stem)}&count=1&language=ru&format=json"
+        geo_bytes, _, _ = _safe_stream_get(
+            "https://open-meteo.com",
+            params={"name": city_stem, "count": 1, "language": "en", "format": "json"},
+            max_bytes=64 * 1024,
         )
-        geo_resp = requests.get(geo_url, headers=HEADERS, timeout=TIMEOUT_TOTAL)
-        if geo_resp.status_code != 200:
-            return None
-
-        results = geo_resp.json().get("results")
+        geo_data = json.loads(geo_bytes.decode("utf-8", errors="replace"))
+        results = geo_data.get("results")
         if not results:
             return None
 
@@ -86,39 +180,35 @@ def _fetch_weather_open_meteo(query: str) -> Optional[str]:
         city_name = loc.get("name", raw_city.capitalize())
         country = loc.get("country", "")
 
-        weather_url = (
-            "https://open-meteo.com"
-            f"?latitude={lat}&longitude={lon}"
-            "&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m"
-            "&wind_speed_unit=ms"
+        w_bytes, _, _ = _safe_stream_get(
+            "https://open-meteo.com",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m",
+                "wind_speed_unit": "ms",
+                "timezone": "auto",
+            },
+            max_bytes=64 * 1024,
         )
-
-        w_resp = requests.get(weather_url, headers=HEADERS, timeout=TIMEOUT_TOTAL)
-        if w_resp.status_code != 200:
-            return None
-
-        curr = w_resp.json().get("current", {})
+        w_data = json.loads(w_bytes.decode("utf-8", errors="replace"))
+        curr = w_data.get("current", {})
         temp = curr.get("temperature_2m")
-        feels = curr.get("apparent_temperature")
-        humidity = curr.get("relative_humidity_2m")
-        wind = curr.get("wind_speed_10m")
-
         if temp is None:
             return None
 
         return (
-            f"[Open-Meteo Метеоданные — {city_name}, {country}]: "
-            f"Температура воздуха сейчас {temp}°C (ощущается как {feels}°C), "
-            f"влажность {humidity}%, ветер {wind} м/с."
+            f"[Open-Meteo Weather — {city_name}, {country}]: "
+            f"Temperature {temp}°C (feels like {curr.get('apparent_temperature')}°C), "
+            f"humidity {curr.get('relative_humidity_2m')}%, wind {curr.get('wind_speed_10m')} m/s."
         )
-    except Exception as e:
-        logger.warning(f"Open-Meteo weather lookup failed: {e}")
+    except Exception as exc:
+        logger.warning("Open-Meteo lookup failed: %s", exc)
         return None
 
-#БЛОК 4: Маршрут 2 — Энциклопедия и факты (Wikipedia REST API)
 
-def _fetch_wikipedia_summary(query: str) -> Optional[str]:
-    """Queries Russian Wikipedia REST API for clean encyclopedic facts."""
+def _fetch_wikipedia_summary(query: str) -> str | None:
+    """Queries official Wikipedia OpenSearch + REST Summary APIs (auto-detects RU/EN)."""
     topic = query
     for prefix in WIKI_TRIGGERS:
         if topic.lower().startswith(prefix):
@@ -127,129 +217,135 @@ def _fetch_wikipedia_summary(query: str) -> Optional[str]:
     if not topic:
         return None
 
-    try:
-        search_url = f"https://wikipedia.org{quote(topic)}&limit=1&format=json"
-        s_resp = requests.get(search_url, headers=HEADERS, timeout=TIMEOUT_TOTAL)
-        if s_resp.status_code != 200:
-            return None
+    lang = "ru" if re.search(r"[а-яё]", topic.lower()) else "en"
+    base_api = f"https://{lang}.wikipedia.org"
 
-        data = s_resp.json()
+    try:
+        search_bytes, _, _ = _safe_stream_get(
+            f"{base_api}/w/api.php",
+            params={"action": "opensearch", "search": topic, "limit": 1, "format": "json"},
+            max_bytes=64 * 1024,
+        )
+        data = json.loads(search_bytes.decode("utf-8", errors="replace"))
         if len(data) < 2 or not data[1]:
             return None
 
         exact_title = data[1][0]
-        summary_url = f"https://wikipedia.org{quote(exact_title)}"
-        sum_resp = requests.get(summary_url, headers=HEADERS, timeout=TIMEOUT_TOTAL)
-        if sum_resp.status_code != 200:
-            return None
-
-        extract = sum_resp.json().get("extract", "").strip()
-        if extract:
+        encoded_title = quote(exact_title.replace(" ", "_"))
+        sum_bytes, _, _ = _safe_stream_get(
+            f"{base_api}/api/rest_v1/page/summary/{encoded_title}",
+            max_bytes=128 * 1024,
+        )
+        sum_data = json.loads(sum_bytes.decode("utf-8", errors="replace"))
+        extract = sum_data.get("extract", "").strip()
+        if extract and sum_data.get("type") != "disambiguation":
             return f"[Wikipedia — {exact_title}]: {extract[:1500]}"
         return None
-    except Exception as e:
-        logger.warning(f"Wikipedia lookup failed: {e}")
+    except Exception as exc:
+        logger.warning("Wikipedia lookup failed: %s", exc)
         return None
 
-import tempfile
-
-#БЛОК 5: Парсинг веб-страниц и безопасный просмотр картинок
 
 def fetch_site_content(url: str) -> str:
-    """Fetches and sanitizes readable text with redirect SSRF protection."""
-    if not _is_safe_url(url):
-        return ""
+    """Fetches and sanitizes readable text with strict byte-limit and SSRF protection."""
     try:
-        with requests.get(url, headers=HEADERS, timeout=TIMEOUT_TOTAL, stream=True, allow_redirects=True) as response:
-            if response.status_code != 200 or not _is_safe_url(response.url):
-                return ""
-            cl = response.headers.get("content-length")
-            if cl and int(cl) > 2 * 1024 * 1024:
-                return ""
-            response.encoding = "utf-8"
-            soup = BeautifulSoup(response.text, "html.parser")
-            for el in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript", "form"]):
-                el.extract()
-            clean_text = " ".join(p.strip() for p in soup.get_text(separator=" ").splitlines() if p.strip())
-            return re.sub(r"\s+", " ", clean_text)[:1500].strip()
+        raw_bytes, content_type, _ = _safe_stream_get(url, max_bytes=MAX_HTML_BYTES)
+        if "text/html" not in content_type and "text/plain" not in content_type:
+            return ""
+
+        html_text = raw_bytes.decode("utf-8", errors="replace")
+        soup = BeautifulSoup(html_text, "html.parser")
+        for el in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript", "form", "aside"]):
+            el.extract()
+
+        clean_text = " ".join(line.strip() for line in soup.get_text(separator=" ").splitlines() if line.strip())
+        return re.sub(r"\s+", " ", clean_text)[:1400].strip()
     except Exception:
         return ""
 
+#Блок 4. Безопасный просмотр изображений (с проверкой Magic Bytes), DuckDuckGo и роутер run()
+
+def _detect_image_extension(data: bytes) -> str | None:
+    """Verifies actual image file signature (magic bytes) to prevent spoofed Content-Type attacks."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    return None
+
+
 def show_image_via_os(image_url: str) -> str:
-    """Downloads an image safely into an isolated temp file and opens it."""
-    if not _is_safe_url(image_url):
-        return "\n[Система: Некорректный или небезопасный URL изображения]."
-
+    """Downloads an image safely, verifies magic bytes, and opens it via default OS viewer."""
     try:
-        with requests.get(image_url, headers=HEADERS, timeout=TIMEOUT_TOTAL, stream=True, allow_redirects=True) as response:
-            if not _is_safe_url(response.url):
-                return "\n[Система: Заблокирован небезопасный редирект]."
-            content_type = response.headers.get("Content-Type", "").lower()
-            if response.status_code != 200 or "image" not in content_type:
-                return "\n[Система: Не удалось загрузить изображение]."
+        img_bytes, content_type, _ = _safe_stream_get(image_url, max_bytes=MAX_IMAGE_BYTES)
+        if "image" not in content_type:
+            return "\n[System: Target URL did not return an image content type]."
 
-            ext = ".png" if "png" in content_type else ".webp" if "webp" in content_type else ".jpg"
-            with tempfile.NamedTemporaryFile(prefix="eliza_", suffix=ext, delete=False) as tmp_file:
-                temp_path = tmp_file.name
-                size = 0
-                for chunk in response.iter_content(chunk_size=8192):
-                    size += len(chunk)
-                    if size > MAX_FILE_SIZE:
-                        tmp_file.close()
-                        os.remove(temp_path)
-                        return "\n[Система: Файл превышает лимит 5 МБ]."
-                    tmp_file.write(chunk)
+        ext = _detect_image_extension(img_bytes)
+        if not ext:
+            return "\n[System: Blocked image with invalid or unsupported binary header]."
 
-            if os.path.exists(temp_path):
-                if platform.system() == "Windows":
-                    os.startfile(temp_path)
-                else:
-                    opener = "open" if platform.system() == "Darwin" else "xdg-open"
-                    subprocess.Popen([opener, temp_path])
-                return "\n[Система: Изображение открыто на экране]."
-        return "\n[Система: Ошибка сохранения изображения]."
-    except Exception as e:
-        return f"\n[Система: Ошибка вывода изображения: {e}]."
+        with tempfile.NamedTemporaryFile(prefix="eliza_", suffix=ext, delete=False) as tmp_file:
+            tmp_file.write(img_bytes)
+            temp_path = tmp_file.name
 
-#БЛОК 6: Маршрут 3 — Резервный общий веб-поиск (DuckDuckGo)
+        if platform.system() == "Windows":
+            os.startfile(temp_path)  # type: ignore[attr-defined]
+        else:
+            opener = "open" if platform.system() == "Darwin" else "xdg-open"
+            subprocess.Popen([opener, temp_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        return "\n[System: Image verified and opened on screen]."
+    except PermissionError as sec_err:
+        return f"\n[System: {sec_err}]."
+    except ValueError as size_err:
+        return f"\n[System: {size_err}]."
+    except Exception as exc:
+        logger.warning("Image display failed: %s", exc)
+        return f"\n[System: Failed to display image ({type(exc).__name__})]."
+
 
 def _search_ddgs(query: str) -> str:
-    """General web search provider using DuckDuckGo with deep page extraction."""
+    """General web search provider using DuckDuckGo with safe single-page content extraction."""
     with DDGS() as ddgs:
         try:
             search_results = list(ddgs.text(query, max_results=3, backend="duckduckgo"))
         except TypeError:
             search_results = list(ddgs.text(query, max_results=3))
-        if not search_results:
-            return "По вашему запросу ничего не найдено."
 
-        snippets = []
-        valid_urls = []
-        for i, r in enumerate(search_results):
-            title = r.get("title", "")
-            link = r.get("href", "") or r.get("link", "")
-            body = r.get("body", "") or r.get("snippet", "")
+        if not search_results:
+            return f"No web results found for '{query}'."
+
+        snippets: list[str] = []
+        valid_urls: list[str] = []
+        for idx, item in enumerate(search_results, start=1):
+            title = item.get("title", "").strip()
+            link = (item.get("href") or item.get("link") or "").strip()
+            body = (item.get("body") or item.get("snippet") or "").strip()
             if body:
-                snippets.append(f"{i + 1}. {title}: {body}")
-            if link:
+                snippets.append(f"{idx}. {title}: {body}")
+            if link and _is_safe_url(link):
                 valid_urls.append(link)
 
         detailed_content = ""
-        for url in valid_urls:
+        for url in valid_urls[:2]:  # Проверяем максимум 2 ссылки, чтобы не задерживать ответ
             site_text = fetch_site_content(url)
-            if site_text and len(site_text) > 100:
-                detailed_content = f"\n\n[Подробное содержание {url}]:\n{site_text}"
+            if len(site_text) > 120:
+                detailed_content = f"\n\n[Extracted content from {url}]:\n{site_text}"
                 break
 
-        result_text = "\n".join(snippets) + detailed_content
-        return result_text[:MAX_CONTEXT_CHARS]
+        combined = "\n".join(snippets) + detailed_content
+        return combined[:MAX_CONTEXT_CHARS]
 
-#БЛОК 7: Главная точка входа плагина run() (маршрутизатор)
 
 def run(query: str) -> str:
     """Main plugin entry point with intent routing (Media -> Weather -> Wiki -> Web)."""
     if not query or not query.strip():
-        return "Пустой поисковый запрос."
+        return "Empty search query."
 
     cleaned_query = _clean_search_query(query)
     q_lower = cleaned_query.lower()
@@ -258,16 +354,16 @@ def run(query: str) -> str:
         if any(t in q_lower for t in IMG_TRIGGERS):
             img_query = cleaned_query
             for t in IMG_TRIGGERS:
-                img_query = re.sub(re.escape(t), "", img_query, flags=re.IGNORECASE).strip()
+                img_query = re.sub(rf"\b{re.escape(t)}\b", "", img_query, flags=re.IGNORECASE).strip()
+
             with DDGS() as ddgs:
-                img_results = list(ddgs.images(img_query, max_results=1))
-                first_img = next(iter(img_results), None)
+                first_img = next(iter(ddgs.images(img_query or cleaned_query, max_results=1)), None)
                 if first_img and first_img.get("image"):
                     img_url = first_img["image"]
-                    img_title = first_img.get("title", "Без названия")
+                    img_title = first_img.get("title", "Untitled")
                     media_status = show_image_via_os(img_url)
-                    return f"Найдено изображение '{img_title}'.\nИсточник: {img_url}{media_status}"
-            return "Подходящее изображение не найдено."
+                    return f"Found image '{img_title}'.\nSource: {img_url}{media_status}"
+            return "No suitable image found."
 
         if any(t in q_lower for t in WEATHER_TRIGGERS):
             weather_report = _fetch_weather_open_meteo(cleaned_query)
@@ -280,8 +376,6 @@ def run(query: str) -> str:
                 return wiki_summary
 
         return _search_ddgs(cleaned_query)
-    except Exception as e:
-        return f"Ошибка поиска: {e}"
-
-
-
+    except Exception as exc:
+        logger.error("Web search plugin error for '%s': %s", cleaned_query, exc, exc_info=True)
+        return f"Search error: {type(exc).__name__}"
