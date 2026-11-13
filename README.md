@@ -45,6 +45,7 @@
 
 ## Repository Structure
 
+```text
 eliza-agent-core/
 ├── core/
 │   ├── __init__.py
@@ -65,6 +66,7 @@ eliza-agent-core/
 ├── CLAUDE.md              # Architectural guidelines for AI-assisted development
 ├── .env.example           # Environment configuration template
 └── .gitignore
+```
 
 
 ---
