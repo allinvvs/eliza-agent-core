@@ -1,4 +1,5 @@
-﻿import platform
+﻿import atexit
+import platform
 import shutil
 import subprocess
 from datetime import datetime
@@ -8,12 +9,41 @@ try:
 except ImportError:
     psutil = None
 
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    atexit.register(pynvml.nvmlShutdown)
+    _NVML_AVAILABLE = True
+except Exception:
+    pynvml = None
+    _NVML_AVAILABLE = False
+
 PLUGIN_NAME = "Hardware & VRAM Telemetry"
 TRIGGERS = ["система", "ресурсы", "нагрузка", "статус пк", "cpu", "ram", "видеокарта", "vram", "железо"]
 
 
-def _get_gpu_info() -> str:
-    """Queries NVIDIA GPU utilization and VRAM via nvidia-smi without extra libraries."""
+def _get_gpu_nvml() -> str:
+    """Reads NVIDIA GPU metrics directly via C-API (sub-millisecond latency)."""
+    if not _NVML_AVAILABLE or pynvml is None:
+        return ""
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        raw_name = pynvml.nvmlDeviceGetName(handle)
+        name = raw_name.decode("utf-8") if isinstance(raw_name, bytes) else str(raw_name)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+
+        mem_used_mb = int(mem.used // (1024 ** 2))
+        mem_total_mb = int(mem.total // (1024 ** 2))
+        return f"GPU: {name} (VRAM {mem_used_mb}/{mem_total_mb} МБ, нагрузка {util.gpu}%, {temp}°C)"
+    except Exception:
+        return ""
+
+#Блок 2. Фоллбэк _get_gpu_smi() и основная точка входа run()
+
+def _get_gpu_smi() -> str:
+    """Fallback GPU telemetry via nvidia-smi subprocess if pynvml is unavailable."""
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
@@ -27,6 +57,11 @@ def _get_gpu_info() -> str:
     except Exception:
         pass
     return ""
+
+
+def _get_gpu_info() -> str:
+    """Queries NVIDIA GPU telemetry preferring native NVML over subprocess."""
+    return _get_gpu_nvml() or _get_gpu_smi()
 
 
 def run(query: str = "") -> str:
@@ -49,4 +84,3 @@ def run(query: str = "") -> str:
         parts.append(gpu_str)
 
     return " | ".join(parts)
-

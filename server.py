@@ -39,6 +39,7 @@ if os.path.exists(env_path):
 
 from core.breathing_mod import ElizaBreathingMod
 from core.memory import MemoryManager
+from core.grammar_router import route_intent_with_grammar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("ElizaHTTPServer")
@@ -153,17 +154,18 @@ breathing_mod = ElizaBreathingMod(
     idle_seconds=900,
 )
 
-#БЛОК 3: Единый конвейер обработки запроса (process_chat_turn)
+#БЛОК 3: Единый конвейер обработки запроса (Sync + SSE Stream)
 
-def process_chat_turn(user_input: str) -> dict:
-    """Executes one complete inference turn with plugins, memory, and safety checks."""
+def _prepare_chat_context(user_input: str) -> tuple[list[dict], str | None, str, dict | None]:
+    """Prepares messages, runs matched plugins, or returns an immediate fast-path dict."""
     global plugins
     breathing_mod.touch(user_input)
     cmd_lower = user_input.lower().strip()
 
     if cmd_lower == "плагины":
         plugins = load_plugins()
-        return {"status": "ok", "reply": f"Плагины перезагружены: {list(plugins.keys())}", "plugin_used": None}
+        fast = {"status": "ok", "reply": f"Плагины перезагружены: {list(plugins.keys())}", "plugin_used": None}
+        return [], None, "", fast
 
     plugin_context = ""
     plugin_used = None
@@ -184,6 +186,17 @@ def process_chat_turn(user_input: str) -> dict:
             break
 
     prompt_content = user_input
+    if plugin_used is None:
+        routed_key, routed_query = route_intent_with_grammar(llm, llm_lock, user_input, plugins)
+        if routed_key and routed_key in plugins:
+            p_data = plugins[routed_key]
+            try:
+                res = str(p_data["run"](routed_query))
+            except Exception as e:
+                res = f"Ошибка плагина: {e}"
+            plugin_context = f"\n[Данные от плагина '{p_data['name']}']: {res}\n"
+            plugin_used = routed_key
+
     if plugin_context:
         prompt_content = (
             "<external_data_untrusted>\n"
@@ -220,21 +233,11 @@ def process_chat_turn(user_input: str) -> dict:
 
     messages.extend(reversed(recent_msgs))
     messages.append({"role": "user", "content": prompt_content})
+    return messages, plugin_used, plugin_context, None
 
-    with llm_lock:
-        gen_params = breathing_mod.get_adaptive_params(strict_mode=bool(plugin_context))
-        response = llm.create_chat_completion(
-            messages=messages,
-            max_tokens=512,
-            temperature=gen_params["temperature"],
-            min_p=gen_params["min_p"],
-            repeat_penalty=gen_params["repeat_penalty"],
-            stop=["<end_of_turn>", "<eos>", "<|im_end|>", "\nВы:"],
-            stream=False,
-        )
 
-    choices = response.get("choices") or []
-    raw_answer = choices[0].get("message", {}).get("content", "") if choices else ""
+def _finalize_chat_response(user_input: str, raw_answer: str, plugin_used: str | None, gen_params: dict) -> dict:
+    """Strips internal tags, runs safe post-actions, and updates memory/TTR state."""
     raw_answer = re.sub(r"<(?:thought|channel)>.*?</(?:thought|channel)>", "", raw_answer, flags=re.DOTALL)
     clean_answer = breathing_mod.clean_text(raw_answer).strip()
 
@@ -279,10 +282,93 @@ def process_chat_turn(user_input: str) -> dict:
         "inference_params": gen_params,
     }
 
+#БЛОК 3.2: Синхронная и потоковая (stream_chat_turn) функции
+
+def process_chat_turn(user_input: str) -> dict:
+    """Executes one complete synchronous inference turn."""
+    messages, plugin_used, plugin_context, fast_reply = _prepare_chat_context(user_input)
+    if fast_reply is not None:
+        return fast_reply
+
+    with llm_lock:
+        gen_params = breathing_mod.get_adaptive_params(strict_mode=bool(plugin_context))
+        response = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=512,
+            temperature=gen_params["temperature"],
+            min_p=gen_params["min_p"],
+            repeat_penalty=gen_params["repeat_penalty"],
+            stop=["<end_of_turn>", "<eos>", "<|im_end|>", "\nВы:"],
+            stream=False,
+        )
+
+    choices = response.get("choices") or []
+    raw_answer = choices[0].get("message", {}).get("content", "") if choices else ""
+    return _finalize_chat_response(user_input, raw_answer, plugin_used, gen_params)
+
+
+def stream_chat_turn(user_input: str):
+    """Yields SSE events in real time while holding llm_lock safely."""
+    messages, plugin_used, plugin_context, fast_reply = _prepare_chat_context(user_input)
+    if fast_reply is not None:
+        yield {"token": fast_reply["reply"], "done": False}
+        yield {**fast_reply, "token": "", "done": True}
+        return
+
+    full_chunks: list[str] = []
+    in_hidden_tag = False
+    tag_buffer = ""
+
+    with llm_lock:
+        gen_params = breathing_mod.get_adaptive_params(strict_mode=bool(plugin_context))
+        stream_iter = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=512,
+            temperature=gen_params["temperature"],
+            min_p=gen_params["min_p"],
+            repeat_penalty=gen_params["repeat_penalty"],
+            stop=["<end_of_turn>", "<eos>", "<|im_end|>", "\nВы:"],
+            stream=True,
+        )
+        for chunk in stream_iter:
+            choices = chunk.get("choices") or []
+            delta = choices[0].get("delta", {}).get("content", "") if choices else ""
+            if not delta:
+                continue
+
+            full_chunks.append(delta)
+            tag_buffer += delta
+
+            if not in_hidden_tag:
+                open_match = re.search(r"<(?:thought|channel)>", tag_buffer)
+                if open_match:
+                    visible_prefix = tag_buffer[:open_match.start()]
+                    if visible_prefix:
+                        yield {"token": visible_prefix, "done": False}
+                    tag_buffer = tag_buffer[open_match.end():]
+                    in_hidden_tag = True
+                elif "<" not in tag_buffer:
+                    yield {"token": tag_buffer, "done": False}
+                    tag_buffer = ""
+            else:
+                close_match = re.search(r"</(?:thought|channel)>", tag_buffer)
+                if close_match:
+                    tag_buffer = tag_buffer[close_match.end():]
+                    in_hidden_tag = False
+                    if tag_buffer and "<" not in tag_buffer:
+                        yield {"token": tag_buffer, "done": False}
+                        tag_buffer = ""
+
+        if tag_buffer and not in_hidden_tag:
+            yield {"token": tag_buffer, "done": False}
+
+    final_payload = _finalize_chat_response(user_input, "".join(full_chunks), plugin_used, gen_params)
+    yield {**final_payload, "token": "", "done": True}
+
 #БЛОК 4: JSON over HTTP Обработчик и точка запуска сервера
 
 class ElizaAPIHandler(BaseHTTPRequestHandler):
-    """REST JSON API handler for ELIZA Agent Core."""
+    """REST JSON & SSE Streaming API handler for ELIZA Agent Core."""
 
     def _send_json(self, status_code: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -291,6 +377,22 @@ class ElizaAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_sse_stream(self, user_msg: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for event in stream_chat_turn(user_msg):
+                line = f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+                self.wfile.write(line)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info("SSE client disconnected mid-stream.")
 
     def log_message(self, format: str, *args) -> None:
         logger.info(f"{self.client_address[0]} - {format % args}")
@@ -332,8 +434,11 @@ class ElizaAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"status": "error", "message": "Field 'message' is required"})
                 return
 
-            result = process_chat_turn(user_msg)
-            self._send_json(200, result)
+            if bool(data.get("stream", False)):
+                self._send_sse_stream(user_msg)
+            else:
+                result = process_chat_turn(user_msg)
+                self._send_json(200, result)
         except json.JSONDecodeError:
             self._send_json(400, {"status": "error", "message": "Malformed JSON"})
         except Exception as e:
@@ -354,4 +459,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

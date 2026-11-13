@@ -34,6 +34,7 @@ if os.path.exists(env_path):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
+from core.grammar_router import route_intent_with_grammar
 from core.breathing_mod import ElizaBreathingMod
 from core.memory import MemoryManager
 
@@ -225,6 +226,15 @@ def main() -> None:
                     print(f"[Плагин {p_data['name']}]: {res}")
                     plugin_context = f"\n[Данные от плагина '{p_data['name']}']: {res}\n"
                     break
+
+            if not plugin_context and cmd_lower != "код":
+                routed_key, routed_query = route_intent_with_grammar(llm, llm_lock, user_input, plugins)
+                if routed_key and routed_key in plugins:
+                    p_data = plugins[routed_key]
+                    res = execute_plugin(plugins, routed_key, routed_query)
+                    print(f"[Плагин {p_data['name']}]: {res}")
+                    plugin_context = f"\n[Данные от плагина '{p_data['name']}']: {res}\n"
+
 
             if cmd_lower == "код":
                 try:
