@@ -66,6 +66,7 @@ eliza-agent-core/
 ├── .env.example           # Environment configuration template
 └── .gitignore
 
+
 ---
 
 ## Quick Start
