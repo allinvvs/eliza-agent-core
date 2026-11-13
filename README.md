@@ -1,8 +1,8 @@
 ﻿# ELIZA v5 — Modular Local AI Agent & JSON HTTP Core
 
 [![ELIZA Core CI](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml/badge.svg)](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml)
-![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)
-![Hardware](https://img.shields.io/badge/VRAM-4GB%20CUDA%20Optimized-green)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml)
+[![Hardware](https://img.shields.io/badge/VRAM-4GB%20CUDA%20Optimized-green)](https://github.com/allinvvs/eliza-agent-core/actions/workflows/tests.yml)
 
 **ELIZA v5** is a lightweight, modular local AI agent engine and REST API server built on `llama-cpp-python` (`llama.cpp`). Engineered specifically for consumer low-VRAM hardware (tested on **NVIDIA GTX 1650 4GB**), it combines a RAM-cached two-tier memory engine, a lexical-diversity adaptive inference controller, hot-reloadable plugins, OS command sandboxing, and a zero-dependency JSON over HTTP server.
 
