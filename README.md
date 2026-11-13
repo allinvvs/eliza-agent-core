@@ -82,7 +82,7 @@ All commands below can be run in **Windows PowerShell**, **VS Code Terminal** (`
 
 ### 1. Clone & Create an Isolated Virtual Environment
 
-    git clone https://github.com
+    git clone https://github.com/allinvvs/eliza-agent-core.git
     cd eliza-agent-core
     python -m venv .venv
 
@@ -126,7 +126,7 @@ All commands below can be run in **Windows PowerShell**, **VS Code Terminal** (`
 ## Connecting External UIs & IDE Extensions
 
 Подключение OpenAI-совместимых интерфейсов (**Open WebUI**, **SillyTavern**, **Continue** в VS Code):
-* **Base URL:** `http://127.0.0`
+* **Base URL:** `http://127.0.0.1:8000/v1`
 * **Model ID:** `eliza-v5-local`
 * **API Key:** опционально (`ELIZA_API_KEY` в `.env`)
 
