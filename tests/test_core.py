@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 import tempfile
+import dataclasses
 import threading
 import time
 import unittest
@@ -136,8 +137,8 @@ class TestElizaCore(unittest.TestCase):
         self.assertIn("not in the allowlist", sandbox.run("cmd.exe /c whoami"))
 
         # AST sandbox escapes
-        self.assertIn("Blocked AST construct", sandbox.run("py: import os; print(os.getcwd())"))
-        self.assertIn("Blocked dunder", sandbox.run("py: print(().__class__.__bases__)"))
+        self.assertIn("Blocked AST node", sandbox.run("py: import os; print(os.getcwd())"))
+        self.assertIn("Dunder attribute access is forbidden", sandbox.run("py: print(().__class__.__bases__)"))
 
         # Output flood protection (must truncate strictly within context budget)
         flood_res = sandbox.run("py: print('X' * 5000)")
@@ -145,9 +146,10 @@ class TestElizaCore(unittest.TestCase):
         self.assertLess(len(flood_res), 1700)
 
         # Infinite loop timeout enforcement
-        with patch.object(sandbox, "MAX_EXEC_TIMEOUT", 0.3):
-            timeout_res = sandbox.run("py: while True: pass")
-            self.assertIn("timeout", timeout_res.lower())
+        with patch.object(sandbox, "CONFIG", dataclasses.replace(sandbox.CONFIG, max_exec_timeout=0.3)):
+            result = sandbox.run("py: while True: pass")
+            self.assertIn("timeout", result.lower())
+
 
     # -------------------------------------------------------------------------
     # 5. Hermetic SSRF Guard & Media Magic Bytes (Zero Real Network)
