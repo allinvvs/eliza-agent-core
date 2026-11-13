@@ -30,7 +30,7 @@ def _compile_strict_router_grammar(valid_tool_keys: tuple[str, ...]) -> Any:
         return None
 
     safe_keys = [k for k in valid_tool_keys if _SAFE_TOOL_KEY_RE.match(k)]
-    enum_literals = ['"none"'] + [f'"{k}"' for k in safe_keys]
+    enum_literals = ['\\"none\\"'] + [f'\\"{k}\\"' for k in safe_keys]
     tool_rule = " | ".join(enum_literals)
 
     gbnf_spec = f"""
