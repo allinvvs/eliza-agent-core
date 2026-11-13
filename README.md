@@ -10,9 +10,10 @@
 
 ## Core Architecture & Engineering Highlights
 
-* **Cascaded GBNF Intent Router (`core/grammar_router.py`):**
-  * **Zero-Latency Fast Path:** Explicit trigger matching executes in `0 ms` without extra LLM calls.
-  * **BPE-Safe GBNF Fallback:** For implicit or conversational tool requests, an LRU-cached RFC-8259 JSON grammar constrains `llama.cpp` sampling to emit 100% valid JSON with confidence gating (`high`/`medium`), eliminating malformed tool calls and hallucinated plugin names.
+* **Single-Source Agent Core & Token-Exact Budgeting (`core/engine.py`):**
+  * **Unified Event-Driven Engine:** Consolidates CLI (`eliza`), native REST/SSE, and OpenAI-compatible endpoints into a single thread-safe pipeline with Flash Attention (`flash_attn=True`) and per-turn latency telemetry (`rag_ms`, `ttft_ms`, `tokens_per_sec`).
+  * **Zero-False-Positive Tool Execution:** Replaces brittle keyword triggers with deterministic slash commands (`/pc`, `/web`, `/plugins`, `/metrics`) and single-pass inline tool execution, backed by an LRU-cached GBNF Structured-CoT router (`core/grammar_router.py`).
+  * **Native Tokenizer Context Guard:** Measures exact token counts via `llama.tokenize()` before every turn to guarantee context window safety (`n_ctx=3072`) without truncating system policies.
 * **Two-Tier Hybrid Memory Engine (`core/memory.py`):**
   * **Short-Term Sliding Window:** Token-budgeted dialogue buffer with atomic JSON persistence (`.tmp` + `os.replace`) to prevent file corruption on power loss or interrupts.
   * **Long-Term Ring-Buffered RAG:** Automatic semantic retrieval powered by an in-memory cached **IDF + Russian/English morphological stemmer** with **temporal recency decay** (zero external vector DB or extra VRAM overhead).
@@ -26,8 +27,9 @@
 * **Security & Sandboxing (`main.py`, `server.py`):**
   * **Indirect Prompt Injection Defense:** Wraps untrusted external plugin outputs inside `<external_data_untrusted>` boundaries with strict system policy isolation.
   * **OS Execution Sandbox:** Strict application allowlist (`ALLOWED_APPS`), `shlex` tokenization (`shell=False`), and canonical path traversal protection.
-* **Zero-Dependency JSON & SSE Streaming HTTP API (`server.py`):**
-  * Multi-threaded server built on Python's standard `ThreadingHTTPServer` supporting both synchronous JSON responses and real-time **Server-Sent Events (`text/event-stream`)** with on-the-fly `<thought>` tag filtering for reasoning models (e.g., Gemma).
+* **Zero-Dependency JSON, SSE & OpenAI-Compatible HTTP API (`server.py`):**
+  * Multi-threaded server built on `ThreadingHTTPServer` with socket timeout guards (`30s`) and daemon workers, exposing both native `/chat` (sync & SSE) and OpenAI-compatible `/v1/chat/completions` + `/v1/models` endpoints with on-the-fly `<thought>` filtering.
+  
 
 ---
 
@@ -36,10 +38,10 @@
 | Subsystem / Metric | Implementation | Measured Latency / Footprint |
 | :--- | :--- | :--- |
 | **GPU & VRAM Telemetry** | Direct NVML C-API (`pynvml`) | **~0.5 ms** (vs ~150 ms `nvidia-smi` spawn) |
-| **Explicit Tool Routing** | Compiled keyword/prefix matcher | **< 0.1 ms** (zero LLM overhead) |
-| **Implicit Tool Routing** | Cached GBNF JSON sampler (`max_tokens=96`) | **100% valid JSON**, confidence-gated |
-| **Unit Test Suite (CI)** | `unittest` with mocked NVML/LLM layers | **~13 ms** (5 tests, zero GPU required) |
-| **VRAM Budget** | Quantized GGUF (`n_ctx=3072`, `n_gpu_layers=24`) | Fits cleanly within **4096 MB VRAM** |
+| **Long-Term IDF RAG Lookup** | RAM-cached Russian/English stemmer | **~2.3 ms** per turn (zero external vector DB) |
+| **Deterministic Slash Routing** | Prefix command dispatcher (`/pc`, `/web`) | **< 0.1 ms** (zero LLM overhead) |
+| **Unit Test Suite (CI)** | `unittest` with mocked NVML/LLM layers | **~15 ms** (6 tests, zero GPU required) |
+| **VRAM Budget** | Quantized GGUF (`n_ctx=3072`, `n_batch=512`, `flash_attn=True`) | Fits cleanly within **4096 MB VRAM** |
 
 ---
 
@@ -47,25 +49,30 @@
 
 ```text
 eliza-agent-core/
+├── .github/
+│   └── workflows/
+│       └── tests.yml        # Automated GitHub Actions CI unit test runner
 ├── core/
 │   ├── __init__.py
-│   ├── breathing_mod.py   # Background daemon, telemetry & adaptive Min-P/TTR tuner
-│   ├── engine.py          # Core LLM initialization & inference helpers
-│   ├── grammar_router.py  # LRU-cached GBNF JSON intent router with confidence gating
-│   └── memory.py          # Atomic short-term history & RAM-cached IDF long-term RAG
+│   ├── breathing_mod.py     # Background daemon, telemetry & adaptive Min-P/TTR tuner
+│   ├── engine.py            # Single-source AgentEngine, token budgeting & turn metrics
+│   ├── grammar_router.py    # LRU-cached GBNF Structured-CoT intent router
+│   └── memory.py            # Atomic short-term history & RAM-cached IDF long-term RAG
 ├── plugins/
-│   ├── pc_monitor.py      # Native NVML C-API GPU/VRAM/Temp & host telemetry
-│   ├── sandbox.py         # Isolated OS command execution & path guard
-│   └── web_search.py      # Intent-routed search (Weather, Wiki, Web) with SSRF guard
+│   ├── pc_monitor.py        # Native NVML C-API GPU/VRAM/Temp & host telemetry
+│   ├── sandbox.py           # Isolated OS command execution & path guard
+│   └── web_search.py        # Intent-routed search (Weather, Wiki, Web) with SSRF guard
 ├── tests/
-│   └── test_core.py       # Headless unit tests for RAG, GBNF router, TTR & telemetry
-├── pyproject.toml         # PEP 621 package metadata, optional CUDA/CPU groups & CLI scripts
-├── main.py                # Interactive CLI entry point (`eliza`)
-├── server.py              # Multi-threaded JSON & SSE HTTP API entry point (`eliza-server`)
-├── install.py             # Hardware diagnostics & environment helper script
-├── CLAUDE.md              # Architectural guidelines for AI-assisted development
-├── .env.example           # Environment configuration template
-└── .gitignore
+│   ├── __init__.py
+│   └── test_core.py         # 6 headless unit tests (RAG, GBNF, AgentEngine, TTR & NVML)
+├── .env.example             # Environment configuration template
+├── .gitattributes           # Cross-platform LF line-ending enforcement
+├── .gitignore
+├── CLAUDE.md                # Architectural guidelines for AI-assisted development
+├── install.py               # Hardware diagnostics & environment helper script
+├── main.py                  # Lightweight interactive CLI adapter (`eliza`)
+├── pyproject.toml           # PEP 621 package metadata, optional CUDA/CPU groups & CLI scripts
+└── server.py                # Multi-threaded JSON, SSE & OpenAI-compatible server (`eliza-server`)
 ```
 
 
@@ -117,4 +124,7 @@ Copy `.env.example` to `.env`, place any quantized `.gguf` model (e.g., Gemma, Q
   ```
 * `GET /status` — Returns active plugins, memory statistics, and current adaptive sampler parameters.
 * `GET /notifications` — Retrieves autonomous background observations generated during idle periods.
+* `POST /v1/chat/completions` (**OpenAI-Compatible API**) — Drop-in endpoint for Open WebUI, Continue, and standard OpenAI SDK clients (supports both sync JSON and `"stream": true` SSE chunks).
+* `GET /v1/models` — Lists the local `eliza-v5-local` model for OpenAI-compatible client auto-discovery.
+
 

@@ -11,6 +11,7 @@ if ROOT_DIR not in sys.path:
 
 from core import grammar_router
 from core.breathing_mod import ElizaBreathingMod
+from core.engine import AgentEngine, EngineConfig, execute_os_command
 from core.memory import MemoryManager
 from plugins import pc_monitor
 
@@ -38,17 +39,16 @@ class TestElizaCore(unittest.TestCase):
         self.assertIn("Диск свободно:", output)
         self.assertNotIn("GPU:", output)
 
-#Блок 2. Чистые тесты GBNF-роутера (без доступа к приватным _ функциям) и сэмплера
-
-    def test_grammar_router_routes_valid_high_confidence_intent(self):
+    def test_grammar_router_routes_valid_cot_intent(self):
         fake_plugins = {
-            "pc_monitor": {"name": "Hardware Telemetry", "triggers": ["железо", "vram"], "run": lambda q: "OK"}
+            "pc_monitor": {"name": "Hardware Telemetry", "run": lambda q: "OK"}
         }
         mock_llm = MagicMock(
             return_value={
-                "choices": [{"text": '{"tool": "pc_monitor", "confidence": "high", "query": "температура gpu"}'}]
+                "choices": [{"text": '{"reason": "запрос температуры видеокарты", "tool": "pc_monitor", "query": "температура gpu"}'}]
             }
         )
+        del mock_llm.create_chat_completion
         with patch.object(grammar_router, "LlamaGrammar") as mock_grammar_cls:
             mock_grammar_cls.from_string.return_value = object()
             tool, query = grammar_router.route_intent_with_grammar(
@@ -57,28 +57,42 @@ class TestElizaCore(unittest.TestCase):
         self.assertEqual(tool, "pc_monitor")
         self.assertEqual(query, "температура gpu")
 
-    def test_grammar_router_blocks_low_confidence_and_hallucinated_tools(self):
+    def test_grammar_router_blocks_hallucinated_tools(self):
         fake_plugins = {
-            "pc_monitor": {"name": "Hardware Telemetry", "triggers": ["железо"], "run": lambda q: "OK"}
+            "pc_monitor": {"name": "Hardware Telemetry", "run": lambda q: "OK"}
         }
         with patch.object(grammar_router, "LlamaGrammar") as mock_grammar_cls:
             mock_grammar_cls.from_string.return_value = object()
 
-            low_conf_llm = MagicMock(
-                return_value={"choices": [{"text": '{"tool": "pc_monitor", "confidence": "low", "query": "тест"}'}]}
-            )
-            tool1, _ = grammar_router.route_intent_with_grammar(
-                low_conf_llm, threading.Lock(), "просто болтаем", fake_plugins
-            )
-            self.assertIsNone(tool1)
-
             hallucinated_llm = MagicMock(
-                return_value={"choices": [{"text": '{"tool": "rm_rf_root", "confidence": "high", "query": "x"}'}]}
+                return_value={"choices": [{"text": '{"reason": "опасная команда", "tool": "rm_rf_root", "query": "x"}'}]}
             )
-            tool2, _ = grammar_router.route_intent_with_grammar(
+            del hallucinated_llm.create_chat_completion
+            tool, _ = grammar_router.route_intent_with_grammar(
                 hallucinated_llm, threading.Lock(), "сделай магию", fake_plugins
             )
-            self.assertIsNone(tool2)
+            self.assertIsNone(tool)
+
+    def test_agent_engine_slash_command_and_sandbox(self):
+        self.assertIn("заблокирован", execute_os_command("mkdir C:/Windows/test_dir").lower())
+        self.assertIn("отклонена", execute_os_command("powershell -Command whoami").lower())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cfg = EngineConfig(
+                history_file=os.path.join(tmpdir, "h.json"),
+                diary_file=os.path.join(tmpdir, "d.txt"),
+                idle_seconds=9999,
+            )
+            mock_llm = MagicMock()
+            mock_llm.create_chat_completion.return_value = iter([
+                {"choices": [{"delta": {"content": "Температура чипа в норме."}}]}
+            ])
+            with patch("threading.Timer"):
+                eng = AgentEngine(config=cfg, llm_instance=mock_llm)
+                res = eng.run_turn("/pc")
+            self.assertEqual(res["plugin_used"], "pc_monitor")
+            self.assertIn("Температура чипа", res["reply"])
+            self.assertIn("rag_ms", res["metrics"])
 
     def test_breathing_mod_adaptive_ttr_and_strict_mode(self):
         with patch("threading.Timer"):
