@@ -12,13 +12,22 @@ import tempfile
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
-import requests
-from bs4 import BeautifulSoup
+import importlib
+from typing import Any
 
-try:
-    from ddgs import DDGS
-except ImportError:
-    from duckduckgo_search import DDGS  # type: ignore[no-redef]
+
+def _optional_import(module_path: str, attr: str | None = None) -> Any:
+    """Safely imports optional third-party backends without crashing headless CI."""
+    try:
+        mod = importlib.import_module(module_path)
+        return getattr(mod, attr) if attr else mod
+    except Exception:
+        return None
+
+
+requests = _optional_import("requests")
+BeautifulSoup = _optional_import("bs4", "BeautifulSoup")
+DDGS = _optional_import("ddgs", "DDGS") or _optional_import("duckduckgo_search", "DDGS")
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +111,9 @@ def _safe_stream_get(
     max_bytes: int = MAX_HTML_BYTES,
 ) -> tuple[bytes, str, str]:
     """Performs HTTP GET validating every redirect hop before connecting and capping download size."""
+    if requests is None:
+        raise RuntimeError("HTTP client ('requests') is not installed.")
+
     current_url = url
     current_params = params
 
@@ -254,6 +266,9 @@ def fetch_site_content(url: str) -> str:
             return ""
 
         html_text = raw_bytes.decode("utf-8", errors="replace")
+        if BeautifulSoup is None:
+            return re.sub(r"<[^>]+>", " ", html_text)[:1400].strip()
+
         soup = BeautifulSoup(html_text, "html.parser")
         for el in soup(["script", "style", "nav", "footer", "header", "iframe", "noscript", "form", "aside"]):
             el.extract()
@@ -311,6 +326,9 @@ def show_image_via_os(image_url: str) -> str:
 
 def _search_ddgs(query: str) -> str:
     """General web search provider using DuckDuckGo with safe single-page content extraction."""
+    if DDGS is None:
+        return "[Web Search]: Search backend ('ddgs' / 'duckduckgo-search') is not installed."
+
     with DDGS() as ddgs:
         try:
             search_results = list(ddgs.text(query, max_results=3, backend="duckduckgo"))
